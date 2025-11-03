@@ -1,15 +1,17 @@
 import sys
 
 def mapper_direct_and_potencial_friends():
-
-    for line in sys.stdin: # python3 mapper_direct_and_potencial_friends.py soc-LiveJournal1Adj.txt > mapper_direct_and_potencial_friends_output.txt
+    # python3 mapper_direct_and_potencial_friends.py < soc-LiveJournal1Adj.txt > mapper_direct_and_potencial_friends_output.txt
+    for line in sys.stdin:
         user_data = line.strip()
         if not user_data:
             continue
       
-        user_str, friends_str = user_data.split('\t', 1)
-        user = int(user_str)
-        friends = friends_str.split(',')
+        data = user_data.split('\t', 1)
+        if len(data) != 2:
+            continue
+        user = int(data[0])
+        friends = data[1].split(',')
         if not friends:
             continue
 
