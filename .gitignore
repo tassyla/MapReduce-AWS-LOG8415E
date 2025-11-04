@@ -1,1 +1,4 @@
 friend-recommendation/results/
+benchmark/__pycache__/
+utils/__pycache__/
+labuser.pem
