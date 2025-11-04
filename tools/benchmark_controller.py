@@ -4,6 +4,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import json
+from pathlib import Path
 from datetime import datetime, timezone
 import re  # Adicionado para extrair o tempo
 
@@ -69,6 +72,43 @@ def remote_write_file(host: str, key_path: str, user: str, content: str, remote_
             pass
 
 # --- NOVA FUNÇÃO ---
+# Aguarda o SSH ficar disponível antes de executar comandos remotos
+def wait_for_ssh(host: str, key_path: str, user: str, max_wait_sec: int = 300, interval: int = 5):
+    deadline = time.time() + max_wait_sec
+    attempt = 0
+    last_err = None
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            # tentativa rápida para verificar conectividade
+            subprocess.run(
+                [
+                    "ssh",
+                    "-i",
+                    key_path,
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "ConnectTimeout=5",
+                    f"{user}@{host}",
+                    "true",
+                ],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            last_err = e
+            time.sleep(interval)
+        except Exception as e:  # erros de rede genéricos
+            last_err = e
+            time.sleep(interval)
+    if last_err:
+        raise last_err
+    raise RuntimeError("SSH not reachable within timeout")
+
+# --- NOVA FUNÇÃO ---
 # Helper para extrair o tempo 'real' da saída do comando 'time -p'
 def parse_time(time_output: str) -> float:
     """Extrai o tempo 'real' da saída stderr do comando 'time -p'."""
@@ -130,6 +170,10 @@ def main():
         "--no-progress-sec", type=int, default=600,
         help="Abort early if cloud-init output shows no growth for this many seconds (0 to disable; default: 600 = 10 min)",
     )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Print full remote command outputs (Hadoop/Spark/SSH). Default: only show timings and summaries.",
+    )
     args = parser.parse_args()
 
     ensure_key_perms(args.key)
@@ -147,6 +191,15 @@ def main():
         ". /etc/profile 2>/dev/null || true; . ~/.profile 2>/dev/null || true; "
         ". /etc/profile.d/hadoop_spark.sh 2>/dev/null || true"
     )
+
+    # Aguarda o servidor SSH aceitar conexões (evita timeout inicial)
+    print("Waiting for SSH to become available...")
+    try:
+        wait_for_ssh(host, key, user, max_wait_sec=min(300, args.bootstrap_timeout_sec))
+    except Exception:
+        # tenta mais uma vez rápido antes de falhar
+        time.sleep(5)
+        wait_for_ssh(host, key, user, max_wait_sec=60)
 
     # --- LÓGICA DE GERAÇÃO DE DADOS REMOVIDA ---
 
@@ -186,13 +239,22 @@ def main():
         f"fi"
     )
 
-    # Prepara o HDFS
+    # Prepara o HDFS (garante que o serviço está ativo e acessível)
     print("Preparing HDFS...")
     ssh(
         host,
         key,
         user,
-        f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:9000); "
+        f"{prefix}; "
+        f"for i in $(seq 1 75); do "
+        f"  FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
+        f"  hdfs dfs -ls \"$FS/\" >/dev/null 2>&1 && echo ready && break; "
+        f"  systemctl --no-pager --quiet is-active hadoop-dfs.service || systemctl start hadoop-dfs.service || true; "
+        f"  sudo -u ubuntu HADOOP_HOME=/opt/hadoop JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64 /opt/hadoop/sbin/start-dfs.sh || true; "
+        f"  sleep 4; "
+        f"done; "
+        f"FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
+        f"hdfs dfs -ls \"$FS/\" >/dev/null 2>&1 || (echo 'HDFS is not reachable after waiting; diagnostics:'; systemctl status --no-pager hadoop-dfs.service 2>/dev/null || true; journalctl -u hadoop-dfs.service -n 120 --no-pager 2>/dev/null || true; tail -n 120 /opt/hadoop/logs/*namenode* 2>/dev/null || true; exit 1); "
         f"hdfs dfs -mkdir -p \"$FS/input\" || true"
     )
 
@@ -243,7 +305,7 @@ def main():
         hdfs_data_path = f"\"$FS/input/{dataset_name}.txt\""
         ssh(
             host, key, user,
-            f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:9000); "
+            f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
             f"hdfs dfs -put -f {remote_data_path} {hdfs_data_path}"
         )
 
@@ -255,16 +317,18 @@ def main():
         ltime = parse_time(lout)
         results['linux'].append(ltime)
         print(f"Linux time: {ltime:.2f}s")
-        print(lout)
+        if args.verbose:
+            print(lout)
 
         # --- Teste 2: Hadoop (3 vezes) ---
         hadoop_runs = []
         for j in range(3):
             print(f"Running Hadoop MapReduce wordcount (Run {j+1}/3)...")
             hdfs_out_path = f"\"$FS/out-hadoop-{ts}-{j}\""
+            # Reduz verbosidade do Hadoop usando HADOOP_ROOT_LOGGER=WARN,console
             hadoop_cmd = (
-                f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:9000); "
-                f"( time -p hadoop jar /opt/hadoop/share/hadoop/mapreduce/"
+                f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
+                f"( time -p HADOOP_ROOT_LOGGER=WARN,console hadoop jar /opt/hadoop/share/hadoop/mapreduce/"
                 f"hadoop-mapreduce-examples-3.3.6.jar wordcount {hdfs_data_path} {hdfs_out_path} ) 2>&1"
             )
             try:
@@ -273,7 +337,8 @@ def main():
                 htime = parse_time(hout)
                 hadoop_runs.append(htime)
                 print(f"Hadoop run {j+1} time: {htime:.2f}s")
-                print(hout)
+                if args.verbose:
+                    print(hout)
             except subprocess.CalledProcessError as e:
                 print("Hadoop job failed:\n", e.stderr)
         if hadoop_runs:
@@ -284,8 +349,9 @@ def main():
         for j in range(3):
             print(f"Running Spark wordcount (Run {j+1}/3)...")
             hdfs_out_path = f"\"$FS/out-spark-{ts}-{j}\""
+            # Mantém saída mínima: não imprimir logs do Spark quando não for verbose
             spark_cmd = (
-                f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:9000); "
+                f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
                 f"( time -p spark-submit --master local[*] /opt/benchmark/wordcount.py {hdfs_data_path} {hdfs_out_path} ) 2>&1"
             )
             try:
@@ -294,7 +360,8 @@ def main():
                 stime = parse_time(sout)
                 spark_runs.append(stime)
                 print(f"Spark run {j+1} time: {stime:.2f}s")
-                print(sout)
+                if args.verbose:
+                    print(sout)
             except subprocess.CalledProcessError as e:
                 print("Spark job failed:\n", e.stderr)
         if spark_runs:
@@ -316,6 +383,59 @@ def main():
     print("\nBenchmark concluído.")
     print("Dados brutos (médias por dataset):")
     print(results)
+
+    # Persistir resultados localmente (JSON e tentativa de plot)
+    out_dir = Path.cwd() / "benchmarks"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    overall = {
+        "linux_avg": (sum(results['linux']) / len(results['linux'])) if results['linux'] else None,
+        "hadoop_avg": (sum(results['hadoop']) / len(results['hadoop'])) if results['hadoop'] else None,
+        "spark_avg": (sum(results['spark']) / len(results['spark'])) if results['spark'] else None,
+        "per_dataset": results,
+    }
+    with open(out_dir / "benchmark_results.json", "w", encoding="utf-8") as f:
+        json.dump(overall, f, indent=2)
+    # CSV simples
+    try:
+        import csv
+        with open(out_dir / "benchmark_results.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["dataset_index", "linux_avg_s", "hadoop_avg_s", "spark_avg_s"])
+            n = max(len(results['linux']), len(results['hadoop']), len(results['spark']))
+            for i in range(n):
+                w.writerow([
+                    i+1,
+                    results['linux'][i] if i < len(results['linux']) else "",
+                    results['hadoop'][i] if i < len(results['hadoop']) else "",
+                    results['spark'][i] if i < len(results['spark']) else "",
+                ])
+    except Exception:
+        pass
+
+    # Plot opcional (se matplotlib estiver instalado)
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        n = max(len(results['linux']), len(results['hadoop']), len(results['spark']))
+        x = np.arange(1, n+1)
+        plt.figure(figsize=(10,5))
+        if results['linux']:
+            plt.plot(x[:len(results['linux'])], results['linux'], label="Linux", marker="o")
+        if results['hadoop']:
+            plt.plot(x[:len(results['hadoop'])], results['hadoop'], label="Hadoop", marker="o")
+        if results['spark']:
+            plt.plot(x[:len(results['spark'])], results['spark'], label="Spark", marker="o")
+        plt.xlabel("Dataset (1..9)")
+        plt.ylabel("Tempo médio por dataset (s)")
+        plt.title("WordCount - Médias por Dataset")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_dir / "benchmark_plot.png", dpi=150)
+        plt.close()
+        print(f"\nResultados salvos em: {out_dir / 'benchmark_results.json'} e plot em {out_dir / 'benchmark_plot.png'}")
+    except Exception:
+        print("(Plot opcional não gerado - instale matplotlib para habilitar)")
 
 
 if __name__ == "__main__":
