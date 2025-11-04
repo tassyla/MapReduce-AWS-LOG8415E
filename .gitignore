@@ -1,1 +1,78 @@
+########################################
+# Python
+########################################
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Mac/Linux/Windows system files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+
+# Logs and test outputs
+*.log
+*.out
+*.tmp
+*.swp
+*.bak
+
+# Project-specific artifacts
+*.csv
+*.json
+*.png
+*.pdf
+*.svg
+*.dat
+*.zip
+*.tar.gz
+*.tar
+*.gz
+*.xlsx
+*.xls
+
+# Results and reports
 friend-recommendation/results/
+report.tex
+results/
+output/
+
+# AWS/Cloud
+.aws/
+
+# Ignore Hadoop/Spark temp files
+*.eventlog
+*.crc
+
+# Ignore compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Misc
+node_modules/
+dist/
+build/
+coverage/
+htmlcov/
+site/
+tmp/
+test-results/
