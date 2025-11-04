@@ -1,6 +1,5 @@
 from utils.config import make_session
 from utils.constants import KEY_NAME, LB_SG_NAME
-from botocore.exceptions import ClientError
 from urllib.request import urlopen
 from benchmark.user_data import build_benchmark_user_data
 
