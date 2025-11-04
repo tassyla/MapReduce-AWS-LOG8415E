@@ -35,11 +35,8 @@ R_OUT="$R_TMP/recommendations.txt"
 # Prepare results dir
 rm -rf "$RESULTS_DIR" && mkdir -p "$RESULTS_DIR"
 
-# Determine S3 bucket to use
-if [ -z "${FRIEND_BUCKET:-}" ]; then
-  FRIEND_BUCKET="friend-reco-$(date +%s)"
-  echo "[Auto] Using generated S3 bucket: $FRIEND_BUCKET"
-fi
+# Generate S3 bucket to use
+FRIEND_BUCKET="friend-reco-$(date +%s)"
 
 # Launch friend recommendation instances
 echo ">>> Launching 3 instances for friend recommendation..."
@@ -105,7 +102,7 @@ scp -3 -i "$KEY_PATH" -o StrictHostKeyChecking=no \
 
 # Suffle/Sort part1.txt on mapper2
 echo ">>> Sorting mapper2 input on ${MAPPER2_IP} (Shuffle step)..."
-ssh_nk "$MAPPER2_IP" "sort -T ${R_TMP} -t '\t' -k1,1n -k2,2n ${R_TMP}/mapper2_unsorted_input.txt > ${R_TMP}/mapper2_input.txt"
+ssh_nk "$MAPPER2_IP" "sort -T ${R_TMP} -t $'\t' -k1,1n -k2,2n ${R_TMP}/mapper2_unsorted_input.txt > ${R_TMP}/mapper2_input.txt"
 ssh_nk "$MAPPER2_IP" "rm ${R_TMP}/mapper2_unsorted_input.txt" # Clean up original unsorted file
 
 # Run mapper2 (part1.txt -> part2.txt)
