@@ -2,7 +2,6 @@ import os
 
 
 KEY_NAME = "labsuser"
-LB_SG_NAME = "custom-lb-sg" # Re-use from Assignment 1
 DEFAULT_KEY_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", f"labsuser.pem")
 )
@@ -20,4 +19,6 @@ DEFAULT_KEY_PATH = os.path.normpath(
 # DEFAULT_USER = "ec2-user"
 # DEFAULT_CPU_THRESHOLD = 70.0
 # DEFAULT_PORT = APP_PORT
+# LB_SG_NAME = "custom-lb-sg" # Re-use from Assignment 1
+
 

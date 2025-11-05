@@ -1,136 +1,130 @@
 import argparse
+import csv
+import json
 import os
+import re
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-import json
-from pathlib import Path
 from datetime import datetime, timezone
-import re  # Added to extract execution time
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.constants import DEFAULT_KEY_PATH
 
+# Constants
+ENV_SETUP_SCRIPT = "/etc/profile.d/hadoop_spark.sh"
+HDFS_DEFAULT_URI = "hdfs://localhost:8020"
+BENCHMARK_DIR = "/opt/benchmark"
+BENCHMARK_READY_LOG = "/var/log/benchmark-ready.log"
+HADOOP_MAPREDUCE_JAR = "/opt/hadoop/share/hadoop/mapreduce/hadoop-mapreduce-examples-3.3.6.jar"
 
-def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
+SSH_CONNECT_TIMEOUT = 5
+SSH_CHECK_INTERVAL = 5
+HADOOP_RUNS_PER_DATASET = 3
+SPARK_RUNS_PER_DATASET = 3
+
+DATASETS = [
+    "https://tinyurl.com/4vxdw3pa",
+    "https://tinyurl.com/kh9excea",
+    "https://tinyurl.com/dybs9bnk",
+    "https://tinyurl.com/datumz6m",
+    "https://tinyurl.com/j4j4xdw6",
+    "https://tinyurl.com/ym8s5fm4",
+    "https://tinyurl.com/2h6a75nk",
+    "https://tinyurl.com/vwvram8",
+    "https://tinyurl.com/weh83uyn"
+]
+
+
+def ensure_key_permissions(key_path: str) -> None:
+    """Ensure SSH key has correct permissions (read/write for owner only)."""
     try:
-        return subprocess.run(cmd, check=True, text=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        print("Command failed:", " ".join(cmd))
-        if e.stdout:
-            print("--- stdout ---\n" + e.stdout)
-        if e.stderr:
-            print("--- stderr ---\n" + e.stderr)
-        raise
-
-# Modified SSH helper to return the full process object
-def ssh(host: str, key_path: str, user: str, remote_cmd: str) -> subprocess.CompletedProcess:
-    cmd = [
-        "ssh",
-        "-i",
-        key_path,
-        "-o",
-        "StrictHostKeyChecking=no",
-        f"{user}@{host}",
-        remote_cmd,
-    ]
-    return run_cmd(cmd)
-
-
-def scp_to(host: str, key_path: str, user: str, local_path: str, remote_path: str):
-    cmd = [
-        "scp",
-        "-i",
-        key_path,
-        "-o",
-        "StrictHostKeyChecking=no",
-        local_path,
-        f"{user}@{host}:{remote_path}",
-    ]
-    run_cmd(cmd)
-
-
-def ensure_key_perms(path: str):
-    try:
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
     except Exception:
         pass
 
 
-def remote_write_file(host: str, key_path: str, user: str, content: str, remote_path: str):
-    fd, tmp = tempfile.mkstemp()
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(content)
+def get_env_prefix() -> str:
+    """Return command to source Hadoop/Spark environment variables."""
+    return f". {ENV_SETUP_SCRIPT} 2>/dev/null"
+
+def run_command(cmd: list[str]) -> subprocess.CompletedProcess:
+    """Execute a shell command and return the result."""
+    return subprocess.run(cmd, check=True, text=True, capture_output=True)
+
+
+def ssh_execute(host: str, key_path: str, user: str, command: str) -> subprocess.CompletedProcess:
+    """Execute a command on a remote host via SSH."""
+    ssh_cmd = [
+        "ssh", "-i", key_path,
+        "-o", "StrictHostKeyChecking=no",
+        f"{user}@{host}",
+        command,
+    ]
+    return run_command(ssh_cmd)
+
+
+def scp_upload(host: str, key_path: str, user: str, local_path: str, remote_path: str) -> None:
+    """Upload a file to a remote host via SCP."""
+    scp_cmd = [
+        "scp", "-i", key_path,
+        "-o", "StrictHostKeyChecking=no",
+        local_path,
+        f"{user}@{host}:{remote_path}",
+    ]
+    run_command(scp_cmd)
+
+
+def upload_file_content(host: str, key_path: str, user: str, content: str, remote_path: str) -> None:
+    """Write content to a temporary file and upload it to remote host."""
+    fd, tmp_path = tempfile.mkstemp()
     try:
-        scp_to(host, key_path, user, tmp, remote_path)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        scp_upload(host, key_path, user, tmp_path, remote_path)
     finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        os.remove(tmp_path)
 
-# --- NOVA FUNÇÃO ---
-# Aguarda o SSH ficar disponível antes de executar comandos remotos
-def wait_for_ssh(host: str, key_path: str, user: str, max_wait_sec: int = 300, interval: int = 5):
+
+def wait_for_ssh_availability(host: str, key_path: str, user: str, 
+                               max_wait_sec: int = 300, 
+                               interval: int = SSH_CHECK_INTERVAL) -> None:
+    """Wait until SSH connection becomes available on the remote host."""
     deadline = time.time() + max_wait_sec
-    attempt = 0
-    last_err = None
     while time.time() < deadline:
-        attempt += 1
         try:
-            # tentativa rápida para verificar conectividade
             subprocess.run(
-                [
-                    "ssh",
-                    "-i",
-                    key_path,
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "ConnectTimeout=5",
-                    f"{user}@{host}",
-                    "true",
-                ],
-                check=True,
-                text=True,
-                capture_output=True,
+                ["ssh", "-i", key_path, 
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+                 f"{user}@{host}", "true"],
+                check=True, text=True, capture_output=True
             )
-            return True
-        except subprocess.CalledProcessError as e:
-            last_err = e
+            return
+        except (subprocess.CalledProcessError, Exception):
             time.sleep(interval)
-        except Exception as e:  # erros de rede genéricos
-            last_err = e
-            time.sleep(interval)
-    if last_err:
-        raise last_err
-    raise RuntimeError("SSH not reachable within timeout")
+    raise RuntimeError(f"SSH not reachable within {max_wait_sec} seconds")
 
-# --- NOVA FUNÇÃO ---
-# Helper para extrair o tempo 'real' da saída do comando 'time -p'
-def parse_time(time_output: str) -> float:
-    """Extracts the real elapsed time from stderr of the command `time -p`."""
+
+def extract_execution_time(time_output: str) -> float:
+    """Parse and extract elapsed time from 'time -p' command output."""
     match = re.search(r"real\s+(\d+\.\d+)", time_output)
-    if match:
-        return float(match.group(1))
-    return 0.0
+    return float(match.group(1)) if match else 0.0
 
-# Function to run the Linux WordCount benchmark
-def run_linux_wordcount(host: str, key: str, user: str, prefix: str, remote_path: str) -> str:
-    """Runs the WordCount benchmark using basic Linux commands."""
-    print(f"Running Linux wordcount on {remote_path}...")
-    linux_cmd = (
+
+def run_linux_wordcount(host: str, key: str, user: str, prefix: str, data_path: str) -> str:
+    """Execute WordCount benchmark using native Linux commands."""
+    command = (
         f"{prefix}; "
-        f"( time -p cat {remote_path} | tr ' ' '\\n' | sort | uniq -c > /tmp/linux-out.txt ) 2>&1"
+        f"( time -p cat {data_path} | tr ' ' '\\n' | sort | uniq -c > /tmp/linux-out.txt ) 2>&1"
     )
-    try:
-        res = ssh(host, key, user, linux_cmd)
-        return res.stdout + res.stderr
-    except subprocess.CalledProcessError as e:
-        print("Linux job failed:\n", e.stderr)
-        return e.stderr
+    result = ssh_execute(host, key, user, command)
+    return result.stdout + result.stderr
 
 
 def build_spark_wordcount_py() -> str:
@@ -152,67 +146,19 @@ lines.saveAsTextFile(out)
 spark.stop()
 """
 
-def main():
-    parser = argparse.ArgumentParser(description="Run WordCount benchmarks on the benchmark instance")
-    parser.add_argument("--host", required=True, help="Public IP or DNS of the instance")
-    parser.add_argument("--user", default="ubuntu")
-    parser.add_argument("--key", default=DEFAULT_KEY_PATH)
-    # Argument --size-mb removed, because we are using fixed datasets
-    parser.add_argument(
-        "--bootstrap-timeout-sec", type=int, default=900,
-        help="Max seconds to wait for user-data readiness (default: 900 = 15 min)",
-    )
-    parser.add_argument(
-        "--no-progress-sec", type=int, default=600,
-        help="Abort early if cloud-init output shows no growth for this many seconds (0 to disable; default: 600 = 10 min)",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="Print full remote command outputs (Hadoop/Spark/SSH). Default: only show timings and summaries.",
-    )
-    args = parser.parse_args()
-
-    ensure_key_perms(args.key)
-
-    host = args.host
-    user = args.user
-    key = args.key
-
-    prefix = (
-        "export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64; "
-        "export HADOOP_HOME=/opt/hadoop; "
-        "export HADOOP_CONF_DIR=/opt/hadoop/etc/hadoop; "
-        "export SPARK_HOME=/opt/spark; "
-        "export PATH=$JAVA_HOME/bin:/opt/hadoop/bin:/opt/hadoop/sbin:/opt/spark/bin:/opt/spark/sbin:$PATH; "
-        ". /etc/profile 2>/dev/null || true; . ~/.profile 2>/dev/null || true; "
-        ". /etc/profile.d/hadoop_spark.sh 2>/dev/null || true"
-    )
-
-    # Aguarda o servidor SSH aceitar conexões (evita timeout inicial)
-    print("Waiting for SSH to become available...")
-    try:
-        wait_for_ssh(host, key, user, max_wait_sec=min(300, args.bootstrap_timeout_sec))
-    except Exception:
-        # tenta mais uma vez rápido antes de falhar
-        time.sleep(5)
-        wait_for_ssh(host, key, user, max_wait_sec=60)
-
-    # --- LÓGICA DE GERAÇÃO DE DADOS REMOVIDA ---
-
-    # Espera o user-data terminar: loop com timeout e detecção de estagnação
+def wait_for_bootstrap(host: str, key: str, user: str, prefix: str, bootstrap_timeout: int, no_progress_sec: int):
+    """Wait for user-data bootstrap to complete on the remote instance."""
     print("Waiting for user-data bootstrap to complete...")
-    max_min = args.bootstrap_timeout_sec // 60 or 1
-    early_min = args.no_progress_sec // 60 if args.no_progress_sec > 0 else 0
+    max_min = bootstrap_timeout // 60 or 1
+    early_min = no_progress_sec // 60 if no_progress_sec > 0 else 0
     msg = f"Waiting for user-data bootstrap to complete (up to {max_min} minutes"
     msg += f", early stop if no progress for {early_min} min)" if early_min > 0 else ")"
     print(msg)
-    ssh(
-        host,
-        key,
-        user,
+    
+    ssh_execute(
+        host, key, user,
         f"{prefix}; "
-        # N = number of iterations (interval of 5s)
-        f"N={max(args.bootstrap_timeout_sec // 5,1)}; STALL={max(args.no_progress_sec // 5,0)}; "
+        f"N={max(bootstrap_timeout // 5,1)}; STALL={max(no_progress_sec // 5,0)}; "
         f"n=0; stagn=0; prev=0; "
         f"while [ ! -f /var/log/benchmark-ready.log ] && [ $n -lt $N ]; do "
         f"  CUR=$(ls -l /var/log/cloud-init-output.log 2>/dev/null | awk '{{print $5}}'); CUR=$((CUR+0)); "
@@ -235,12 +181,11 @@ def main():
         f"fi"
     )
 
-    # Prepara o HDFS (garante que o serviço está ativo e acessível)
+def prepare_hdfs(host: str, key: str, user: str, prefix: str):
+    """Prepare and start HDFS service."""
     print("Preparing HDFS...")
-    ssh(
-        host,
-        key,
-        user,
+    ssh_execute(
+        host, key, user,
         f"{prefix}; "
         f"for i in $(seq 1 75); do "
         f"  FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
@@ -254,182 +199,146 @@ def main():
         f"hdfs dfs -mkdir -p \"$FS/input\" || true"
     )
 
-    # Upload Spark WordCount script (logic kept)
+def setup_spark_script(host: str, key: str, user: str, prefix: str):
+    """Upload Spark WordCount script to remote instance."""
     print("Uploading Spark wordcount script...")
     wc_py = build_spark_wordcount_py()
-    ssh(host, key, user, f"{prefix}; sudo mkdir -p /opt/benchmark; sudo chown -R ubuntu:ubuntu /opt/benchmark || true")
-    remote_write_file(host, key, user, wc_py, "/opt/benchmark/wordcount.py")
-    
-    # The 9 datasets required by the assignment
-    datasets = [
-        "https://tinyurl.com/4vxdw3pa",
-        "https://tinyurl.com/kh9excea",
-        "https://tinyurl.com/dybs9bnk",
-        "https://tinyurl.com/datumz6m",
-        "https://tinyurl.com/j4j4xdw6",
-        "https://tinyurl.com/ym8s5fm4",
-        "https://tinyurl.com/2h6a75nk",
-        "https://tinyurl.com/vwvram8",
-        "https://tinyurl.com/weh83uyn"
-    ]
+    ssh_execute(host, key, user, f"{prefix}; sudo mkdir -p /opt/benchmark; sudo chown -R ubuntu:ubuntu /opt/benchmark")
+    upload_file_content(host, key, user, wc_py, "/opt/benchmark/wordcount.py")
 
-    # Dictionary to store all execution times
-    results = {
-        'linux': [],
-        'hadoop': [],
-        'spark': []
-    }
+def run_benchmark_for_dataset(host: str, key: str, user: str, prefix: str, url: str, index: int, total: int) -> tuple[float, float, float]:
+    """Run all three benchmarks (Linux, Hadoop, Spark) for a single dataset."""
+    dataset_name = url.split('/')[-1]
+    remote_data_path = f"/opt/benchmark/data_{dataset_name}.txt"
     
-    print("\n" + "="*50)
-    print("STARTING BENCHMARK SESSION")
-    print("="*50)
+    print(f"\n--- Processing Dataset {index}/{total} ({dataset_name}) ---")
+    
+    # Download and upload to HDFS
+    ssh_execute(host, key, user, f"{prefix}; wget -q -O {remote_data_path} {url}")
+    hdfs_data_path = f"\"$FS/input/{dataset_name}.txt\""
+    ssh_execute(host, key, user, 
+        f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
+        f"hdfs dfs -put -f {remote_data_path} {hdfs_data_path}")
 
-    for i, url in enumerate(datasets):
-        dataset_name = url.split('/')[-1]
-        remote_data_path = f"/opt/benchmark/data_{dataset_name}.txt"
-        
-        print(f"\n--- Processing Dataset {i+1}/{len(datasets)} ({dataset_name}) ---")
-        
-        # 1. Download dataset on the instance
-        print(f"Downloading {url} to {remote_data_path}...")
-        ssh(host, key, user, f"{prefix}; wget -q -O {remote_data_path} {url}")
-        
-        # 2. Upload dataset to HDFS
-        print("Uploading dataset to HDFS...")
-        hdfs_data_path = f"\"$FS/input/{dataset_name}.txt\""
-        ssh(
-            host, key, user,
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    
+    # Linux WordCount
+    lout = run_linux_wordcount(host, key, user, prefix, remote_data_path)
+    linux_time = extract_execution_time(lout)
+
+    # Hadoop WordCount (3 runs)
+    hadoop_runs = []
+    for j in range(3):
+        hdfs_out_path = f"\"$FS/out-hadoop-{ts}-{j}\""
+        hadoop_cmd = (
             f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
-            f"hdfs dfs -put -f {remote_data_path} {hdfs_data_path}"
+            f"( time -p HADOOP_ROOT_LOGGER=WARN,console hadoop jar /opt/hadoop/share/hadoop/mapreduce/"
+            f"hadoop-mapreduce-examples-3.3.6.jar wordcount {hdfs_data_path} {hdfs_out_path} ) 2>&1"
         )
+        res = ssh_execute(host, key, user, hadoop_cmd)
+        hadoop_runs.append(extract_execution_time(res.stdout + res.stderr))
+    hadoop_time = sum(hadoop_runs) / len(hadoop_runs)
 
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-
-        # Test 1: Linux
-        # (Run only once per dataset, since it’s deterministic)
-        lout = run_linux_wordcount(host, key, user, prefix, remote_data_path)
-        ltime = parse_time(lout)
-        results['linux'].append(ltime)
-        print(f"Linux time: {ltime:.2f}s")
-        if args.verbose:
-            print(lout)
-
-        # Test 2: Hadoop (3 runs)
-        hadoop_runs = []
-        for j in range(3):
-            print(f"Running Hadoop MapReduce wordcount (Run {j+1}/3)...")
-            hdfs_out_path = f"\"$FS/out-hadoop-{ts}-{j}\""
-            # Reduz verbosidade do Hadoop usando HADOOP_ROOT_LOGGER=WARN,console
-            hadoop_cmd = (
-                f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
-                f"( time -p HADOOP_ROOT_LOGGER=WARN,console hadoop jar /opt/hadoop/share/hadoop/mapreduce/"
-                f"hadoop-mapreduce-examples-3.3.6.jar wordcount {hdfs_data_path} {hdfs_out_path} ) 2>&1"
-            )
-            try:
-                res = ssh(host, key, user, hadoop_cmd)
-                hout = res.stdout + res.stderr
-                htime = parse_time(hout)
-                hadoop_runs.append(htime)
-                print(f"Hadoop run {j+1} time: {htime:.2f}s")
-                if args.verbose:
-                    print(hout)
-            except subprocess.CalledProcessError as e:
-                print("Hadoop job failed:\n", e.stderr)
-        if hadoop_runs:
-            results['hadoop'].append(sum(hadoop_runs) / len(hadoop_runs)) # Adds the average
-
-        # Test 3: Spark (3 runs)
-        spark_runs = []
-        for j in range(3):
-            print(f"Running Spark wordcount (Run {j+1}/3)...")
-            hdfs_out_path = f"\"$FS/out-spark-{ts}-{j}\""
-            # Mantém saída mínima: não imprimir logs do Spark quando não for verbose
-            spark_cmd = (
-                f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
-                f"( time -p spark-submit --master local[*] /opt/benchmark/wordcount.py {hdfs_data_path} {hdfs_out_path} ) 2>&1"
-            )
-            try:
-                res = ssh(host, key, user, spark_cmd)
-                sout = res.stdout + res.stderr
-                stime = parse_time(sout)
-                spark_runs.append(stime)
-                print(f"Spark run {j+1} time: {stime:.2f}s")
-                if args.verbose:
-                    print(sout)
-            except subprocess.CalledProcessError as e:
-                print("Spark job failed:\n", e.stderr)
-        if spark_runs:
-            results['spark'].append(sum(spark_runs) / len(spark_runs)) # Adds the average
-
-    # Print final results
-    print("\n" + "="*50)
-    print("Final Benchmark Results (Averages)")
-    print("="*50)
+    # Spark WordCount (3 runs)
+    spark_runs = []
+    for j in range(3):
+        hdfs_out_path = f"\"$FS/out-spark-{ts}-{j}\""
+        spark_cmd = (
+            f"{prefix}; FS=$(hdfs getconf -confKey fs.defaultFS 2>/dev/null || echo hdfs://localhost:8020); "
+            f"( time -p spark-submit --master local[*] /opt/benchmark/wordcount.py {hdfs_data_path} {hdfs_out_path} ) 2>&1"
+        )
+        res = ssh_execute(host, key, user, spark_cmd)
+        spark_runs.append(extract_execution_time(res.stdout + res.stderr))
+    spark_time = sum(spark_runs) / len(spark_runs)
     
-    # Calculate and print averages across all datasets
-    if results['linux']:
-        print(f"Linux - Overall Average: {sum(results['linux']) / len(results['linux']):.2f}s")
-    if results['hadoop']:
-        print(f"Hadoop - Overall Average: {sum(results['hadoop']) / len(results['hadoop']):.2f}s")
-    if results['spark']:
-        print(f"Spark - Overall Average: {sum(results['spark']) / len(results['spark']):.2f}s")
-        
-    print("\nBenchmark complete.")
-    print("Raw data (average per dataset):")
-    print(results)
+    return linux_time, hadoop_time, spark_time
 
-    # Persistir resultados localmente (JSON e tentativa de plot)
+def save_results(results: dict):
+    """Save benchmark results to JSON, CSV, and optionally plot."""
     out_dir = Path.cwd() / "benchmarks"
     out_dir.mkdir(parents=True, exist_ok=True)
+    
     overall = {
-        "linux_avg": (sum(results['linux']) / len(results['linux'])) if results['linux'] else None,
-        "hadoop_avg": (sum(results['hadoop']) / len(results['hadoop'])) if results['hadoop'] else None,
-        "spark_avg": (sum(results['spark']) / len(results['spark'])) if results['spark'] else None,
+        "linux_avg": sum(results['linux']) / len(results['linux']),
+        "hadoop_avg": sum(results['hadoop']) / len(results['hadoop']),
+        "spark_avg": sum(results['spark']) / len(results['spark']),
         "per_dataset": results,
     }
+    
+    # Save JSON
     with open(out_dir / "benchmark_results.json", "w", encoding="utf-8") as f:
         json.dump(overall, f, indent=2)
-    # CSV simples
+    
+    # Save CSV
+    with open(out_dir / "benchmark_results.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["dataset_index", "linux_avg_s", "hadoop_avg_s", "spark_avg_s"])
+        for i in range(len(results['linux'])):
+            w.writerow([i+1, results['linux'][i], results['hadoop'][i], results['spark'][i]])
+    
+    # Save plot
     try:
-        import csv
-        with open(out_dir / "benchmark_results.csv", "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["dataset_index", "linux_avg_s", "hadoop_avg_s", "spark_avg_s"])
-            n = max(len(results['linux']), len(results['hadoop']), len(results['spark']))
-            for i in range(n):
-                w.writerow([
-                    i+1,
-                    results['linux'][i] if i < len(results['linux']) else "",
-                    results['hadoop'][i] if i < len(results['hadoop']) else "",
-                    results['spark'][i] if i < len(results['spark']) else "",
-                ])
-    except Exception:
-        pass
-
-    # Plot opcional (se matplotlib estiver instalado)
-    try:
-        import matplotlib.pyplot as plt
-        import numpy as np
-        n = max(len(results['linux']), len(results['hadoop']), len(results['spark']))
+        n = len(results['linux'])
         x = np.arange(1, n+1)
         plt.figure(figsize=(10,5))
-        if results['linux']:
-            plt.plot(x[:len(results['linux'])], results['linux'], label="Linux", marker="o")
-        if results['hadoop']:
-            plt.plot(x[:len(results['hadoop'])], results['hadoop'], label="Hadoop", marker="o")
-        if results['spark']:
-            plt.plot(x[:len(results['spark'])], results['spark'], label="Spark", marker="o")
+        plt.plot(x, results['linux'], label="Linux", marker="o")
+        plt.plot(x, results['hadoop'], label="Hadoop", marker="o")
+        plt.plot(x, results['spark'], label="Spark", marker="o")
         plt.xlabel("Dataset (1..9)")
-        plt.ylabel("Tempo médio por dataset (s)")
-        plt.title("WordCount - Médias por Dataset")
+        plt.ylabel("Average Time (seconds)")
+        plt.title("WordCount Benchmark - Average per Dataset")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(out_dir / "benchmark_plot.png", dpi=150)
         plt.close()
-        print(f"\nResultados salvos em: {out_dir / 'benchmark_results.json'} e plot em {out_dir / 'benchmark_plot.png'}")
-    except Exception:
-        print("(Plot opcional não gerado - instale matplotlib para habilitar)")
+    except ImportError:
+        pass
+    
+    print(f"\nResults saved: {out_dir / 'benchmark_results.json'}, {out_dir / 'benchmark_results.csv'}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", required=True, help="Public IP of the instance")
+    parser.add_argument("--user", default="ubuntu")
+    parser.add_argument("--key", default=DEFAULT_KEY_PATH)
+    parser.add_argument("--bootstrap-timeout-sec", type=int, default=900)
+    parser.add_argument("--no-progress-sec", type=int, default=600)
+    args = parser.parse_args()
+    
+    ensure_key_permissions(args.key)
+    host, user, key = args.host, args.user, args.key
+    prefix = get_env_prefix()
+
+    # Setup remote environment
+    print("Waiting for SSH to become available...")
+    wait_for_ssh_availability(host, key, user, max_wait_sec=min(300, args.bootstrap_timeout_sec))
+    wait_for_bootstrap(host, key, user, prefix, args.bootstrap_timeout_sec, args.no_progress_sec)
+    prepare_hdfs(host, key, user, prefix)
+    setup_spark_script(host, key, user, prefix)
+
+    results = {'linux': [], 'hadoop': [], 'spark': []}
+    
+    print("\n" + "="*50)
+    print("STARTING BENCHMARK SESSION")
+    print("="*50)
+
+    for i, url in enumerate(DATASETS, 1):
+        linux_time, hadoop_time, spark_time = run_benchmark_for_dataset(
+            host, key, user, prefix, url, i, len(DATASETS)
+        )
+        results['linux'].append(linux_time)
+        results['hadoop'].append(hadoop_time)
+        results['spark'].append(spark_time)
+
+    print("\n" + "="*50)
+    print("BENCHMARK RESULTS")
+    print("="*50)
+    print(f"Linux Average:  {sum(results['linux']) / len(results['linux']):.2f}s")
+    print(f"Hadoop Average: {sum(results['hadoop']) / len(results['hadoop']):.2f}s")
+    print(f"Spark Average:  {sum(results['spark']) / len(results['spark']):.2f}s")
+
+    save_results(results)
 
 
 if __name__ == "__main__":
