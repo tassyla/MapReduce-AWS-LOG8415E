@@ -1,8 +1,2 @@
 boto3
 python-dotenv
-
-# === Assignment 1 - legacy ===
-# fastapi 
-# uvicorn
-# httpx
-# aiohttp

@@ -1,6 +1,4 @@
-########################################
 # Python
-########################################
 __pycache__/
 *.py[cod]
 *$py.class
@@ -76,3 +74,6 @@ htmlcov/
 site/
 tmp/
 test-results/
+
+# Personal info
+labsuser.pem
