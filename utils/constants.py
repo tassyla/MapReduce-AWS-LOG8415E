@@ -5,6 +5,7 @@ KEY_NAME = "labsuser"
 DEFAULT_KEY_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", f"labsuser.pem")
 )
+LB_SG_NAME = "custom-lb-sg"
 
 
 # ===== LEGACY (Assignment 1) =====
