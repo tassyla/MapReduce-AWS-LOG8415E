@@ -51,15 +51,12 @@ echo "Benchmark instance running at $BENCH_IP"
 # Wait for SSH to be ready before running the controller
 wait_ssh "$BENCH_IP" "$KEY_PATH" "$SSH_USER"
 
-# Run benchmark controller (adjust args if needed)
+# Run benchmark controller
 echo "Running benchmark controller..."
-# Ensure benchmark_controller.py has access to labsuser.pem if it performs SCP/SSH internally
-python3 tools/benchmark_controller.py --host "$BENCH_IP" --duration 60 --rate 200 || echo "Benchmark controller exited with a non-zero status. Check controller logs for details."
-
-# Create local results folder
-mkdir -p benchmarks/results
-
-echo "Retrieving benchmark results..."
-scp -i "$KEY_PATH" -o StrictHostKeyChecking=no "${SSH_USER}@${BENCH_IP}:~/benchmark_results*" "benchmarks/results/"
+# Controller uses constants for user/key, only needs --host
+python3 tools/benchmark_controller.py --host "$BENCH_IP" --bootstrap-timeout-sec 300 || {
+    echo "Benchmark controller failed. Check output above for details."
+    exit 1
+}
 
 echo "Benchmark orchestration complete. Results in ./benchmarks/results/"

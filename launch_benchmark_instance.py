@@ -1,17 +1,7 @@
 from utils.config import make_session
-from utils.constants import KEY_NAME, LB_SG_NAME
+from utils.constants import KEY_NAME, LB_SG_NAME, UBUNTU_SSM_AMI_PARAMS
 from urllib.request import urlopen
 from benchmark.user_data import build_benchmark_user_data
-
-
-UBUNTU_SSM_AMI_PARAMS = [
-    "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
-    "/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id",
-    "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
-    "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp2/ami-id",
-    "/aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
-    "/aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id",
-]
 
 
 def get_default_vpc_id(ec2_client) -> str:
@@ -84,12 +74,8 @@ def ensure_benchmark_sg(ec2_client, vpc_id: str) -> str:
 
 
 def get_ubuntu_ami_id(ssm_client, ec2_client) -> str:
-    """Retrieve a recent Ubuntu LTS AMI.
-
-    Strategy:
-    1) Try known public SSM parameters (gp3/gp2, 22.04 preferred; 24.04/20.04 as fallback).
-    2) If none exist in region, query EC2 images owned by Canonical and pick latest Jammy 22.04.
-    """
+    """Retrieve a recent Ubuntu LTS AMI."""
+    
     # Step 1: Try SSM parameters
     for param in UBUNTU_SSM_AMI_PARAMS:
         try:
@@ -99,28 +85,20 @@ def get_ubuntu_ami_id(ssm_client, ec2_client) -> str:
         except ssm_client.exceptions.ParameterNotFound:
             continue
         except Exception:
-            # Ignore unexpected issues and try next option
             continue
 
     # Step 2: Describe images from Canonical and choose the newest 22.04
-    try:
-        images = ec2_client.describe_images(
-            Owners=["099720109477"],  # Canonical
-            Filters=[
-                {"Name": "name", "Values": ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]},
-                {"Name": "architecture", "Values": ["x86_64"]},
-                {"Name": "root-device-type", "Values": ["ebs"]},
-                {"Name": "virtualization-type", "Values": ["hvm"]},
-            ],
-        )["Images"]
-        if not images:
-            raise RuntimeError("No Ubuntu 22.04 AMIs found from Canonical in this region.")
-        images.sort(key=lambda img: img["CreationDate"], reverse=True)
-        return images[0]["ImageId"]
-    except Exception as e:
-        raise SystemExit(
-            f"ERROR: Unable to resolve an Ubuntu AMI in this region via SSM or image search: {e}"
-        )
+    images = ec2_client.describe_images(
+        Owners=["099720109477"],  # Canonical
+        Filters=[
+            {"Name": "name", "Values": ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]},
+            {"Name": "architecture", "Values": ["x86_64"]},
+            {"Name": "root-device-type", "Values": ["ebs"]},
+            {"Name": "virtualization-type", "Values": ["hvm"]},
+        ],
+    )["Images"]
+    images.sort(key=lambda img: img["CreationDate"], reverse=True)
+    return images[0]["ImageId"]
 
 
 def launch_benchmark_instance(ec2_client, ssm_client, subnet_id: str, sg_id: str, instance_type: str = "t2.large") -> str:
