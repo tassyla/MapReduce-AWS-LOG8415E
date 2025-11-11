@@ -8,7 +8,7 @@ cd "$SCRIPT_DIR"
 mkdir -p ~/.ssh
 cp -f "$SCRIPT_DIR/labsuser.pem" ~/.ssh/labsuser.pem
 KEY_PATH="$HOME/.ssh/labsuser.pem"
-chmod 600 "$KEY_PATH" # Ensure key permissions (inside WSL)
+chmod 600 "$KEY_PATH"
 SSH_USER="ubuntu"
 REGION="us-east-1"
 
